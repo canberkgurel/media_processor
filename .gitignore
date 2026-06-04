@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Media (inputs/outputs — don't commit large binaries)
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.avi
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.heif
+*.tif
+*.tiff
+*.webp
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch
+_test_*
+_verify.py
