@@ -36,6 +36,7 @@ import argparse
 import time
 import json
 import shutil
+import tempfile
 import platform
 from pathlib import Path
 
@@ -90,12 +91,18 @@ def find_tool(name: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 def resolve_x(position, max_x: int) -> int:
-    """Resolve a position value (string or int) to a pixel x offset."""
+    """
+    Resolve a position value (string or int) to a pixel offset in [0, max_x].
+    Horizontal aliases: 'left'→0, 'right'→max. Vertical aliases (used when the
+    crop window spans the full width, e.g. tall/portrait images): 'top'→0,
+    'bottom'→max. 'center' (or anything else) → midpoint.
+    """
     if isinstance(position, int):
         return max(0, min(position, max_x))
-    elif position == 'left':
+    p = str(position).lower()
+    if p in ('left', 'top'):
         return 0
-    elif position == 'right':
+    elif p in ('right', 'bottom'):
         return max_x
     else:  # 'center'
         return max_x // 2
@@ -127,10 +134,24 @@ def compute_crop(src_w: int, src_h: int,
         crop_w = src_w
         crop_h = int(round(crop_w * target_ratio))
 
-    crop_y = (src_h - crop_h) // 2
     max_x  = src_w - crop_w
+    max_y  = src_h - crop_h
 
-    start_x = resolve_x(position, max_x)
+    # Orientation of the crop window:
+    #  - Landscape-ish source (max_x > 0): the window is narrower than the source,
+    #    so `position` pans horizontally and the vertical crop stays centred.
+    #    (This is the only case for drone/landscape video — behaviour unchanged.)
+    #  - Tall/portrait source (full width used, max_y > 0): the window is the full
+    #    width but shorter than the source, so `position` selects the *vertical*
+    #    window instead ('top'/'bottom'/'center'/int), and crop_x is pinned to 0.
+    vertical_crop = (max_x <= 0 and max_y > 0)
+
+    if vertical_crop:
+        start_x = 0
+        crop_y  = resolve_x(position, max_y)
+    else:
+        start_x = resolve_x(position, max_x)
+        crop_y  = (src_h - crop_h) // 2
 
     # Static crop (original behaviour)
     if position_end is None:
@@ -159,7 +180,12 @@ def compute_crop(src_w: int, src_h: int,
     ff_filter    = f"crop={crop_w}:{crop_h}:{static_x}:{crop_y},scale={target_w}:{target_h}:flags=lanczos"
 
     pan_distance = abs(end_x - start_x)
-    pan_label    = f"pan {pan_distance}px  ({start_x} → {end_x}  {easing})" if animated else f"static  x={start_x}"
+    if animated:
+        pan_label = f"pan {pan_distance}px  ({start_x} → {end_x}  {easing})"
+    elif vertical_crop:
+        pan_label = f"static  y={crop_y} (vertical)"
+    else:
+        pan_label = f"static  x={start_x}"
 
     return {
         'crop_x':       start_x,
@@ -171,6 +197,7 @@ def compute_crop(src_w: int, src_h: int,
         'out_w':        target_w,
         'out_h':        target_h,
         'animated':     animated,
+        'vertical_crop': vertical_crop,   # True → `position` selected the vertical window
         'get_crop_x':   get_crop_x,
         'ff_filter':    ff_filter,   # valid only for static crops
         'pan_label':    pan_label,
@@ -216,6 +243,110 @@ _LOG_LUT = build_apple_log_lut()
 def apply_log_lut(frame_bgr: np.ndarray) -> np.ndarray:
     """Apple Log → Rec.709 via pre-computed per-channel LUT. ~14ms at 4K."""
     return cv2.LUT(frame_bgr, _LOG_LUT)
+
+
+def apply_chroma(frame: np.ndarray, sat: float, vib: float) -> np.ndarray:
+    """
+    Vibrance + saturation in HSV. Shared by the video Enhancer and the image
+    pipeline so both use identical colour math.
+      - sat : saturation multiplier (1.0 = unchanged)
+      - vib : vibrance 0→1 — adaptive boost that affects dull colours more and
+              protects already-saturated areas (e.g. skin tones).
+    """
+    if abs(sat - 1.0) < 0.01 and vib < 0.01:
+        return frame
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
+
+    # Vibrance boost: more effect on low-saturation pixels
+    vib_boost = 1.0 + vib * (1.0 - s / 255.0)
+    s = np.clip(s * sat * vib_boost, 0, 255)
+
+    return cv2.cvtColor(cv2.merge([h, s, v]).astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def apply_temperature(frame: np.ndarray, temp: float) -> np.ndarray:
+    """
+    White-balance temperature shift — the right tool for an overall colour cast
+    (unlike saturation, which only changes how colourful things are).
+      temp < 0 → cooler  (less red, more blue) — neutralises a warm/yellow cast
+      temp > 0 → warmer  (more red, less blue)
+    temp is roughly [-1, 1]; ±1 ≈ ±35% gain on the red/blue channels. Green is
+    left as the luma anchor so brightness stays about the same.
+    """
+    if abs(temp) < 0.01:
+        return frame
+    t = max(-1.0, min(float(temp), 1.0))
+    r_gain = 1.0 + 0.35 * t
+    b_gain = 1.0 - 0.35 * t
+    f = frame.astype(np.float32)
+    f[..., 2] *= r_gain   # R  (OpenCV channel order is BGR)
+    f[..., 0] *= b_gain   # B
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def fit_cover(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """
+    Scale `frame` to completely cover out_w×out_h while preserving aspect ratio,
+    then centre-crop the overflow (the 'cover' fit — fills the frame, no bars).
+    Used to honour force_resolution when the source isn't already that size and
+    no explicit crop step produced it (e.g. a 16:9 clip → 9:16 IG Stories).
+    """
+    h, w = frame.shape[:2]
+    if (w, h) == (out_w, out_h):
+        return frame
+    scale = max(out_w / w, out_h / h)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LANCZOS4
+    resized = cv2.resize(frame, (nw, nh), interpolation=interp)
+    x = (nw - out_w) // 2
+    y = (nh - out_h) // 2
+    return resized[y:y + out_h, x:x + out_w]
+
+
+# Hue-band centres in degrees (0–360), matching the Lightroom-style HSL model.
+HUE_BANDS = ['red', 'orange', 'yellow', 'green', 'aqua', 'blue', 'purple', 'magenta']
+HUE_BAND_CENTERS = {
+    'red': 0,   'orange': 30,  'yellow': 60,  'green': 120,
+    'aqua': 180, 'blue': 240,  'purple': 270, 'magenta': 300,
+}
+
+
+def apply_selective_saturation(frame: np.ndarray, bands: dict, sigma: float = 20.0) -> np.ndarray:
+    """
+    Per-colour (hue-selective) saturation — like Lightroom's HSL Saturation.
+    `bands` maps a colour name (see HUE_BANDS) to a multiplier (1.0 = unchanged).
+
+    All eight hue bands take part in the blend; any band the caller doesn't set
+    defaults to 1.0. Each band contributes a Gaussian weight around its hue-wheel
+    centre and the per-pixel multiplier is the weighted average of the band
+    multipliers. Because every hue is anchored to its own band (multiplier 1.0
+    when unset), reducing e.g. red/orange/yellow leaves greens/blues unchanged
+    instead of spilling onto them. An empty / all-1.0 `bands` is a true no-op.
+
+    Typical use: tame warm tones after a global saturation boost, e.g.
+    bands={'yellow':0.5,'orange':0.7,'red':0.8}.
+    """
+    if not bands or all(abs(m - 1.0) < 0.01 for m in bands.values()):
+        return frame
+
+    # Full 8-band model — unset bands = 1.0 so distant hues stay unchanged.
+    centers = np.array([HUE_BAND_CENTERS[c] for c in HUE_BANDS], dtype=np.float32)
+    mults   = np.array([bands.get(c, 1.0) for c in HUE_BANDS], dtype=np.float32)
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
+    h_deg = h * 2.0  # OpenCV hue is 0–179 → 0–358
+
+    diff = np.abs(h_deg[..., None] - centers[None, None, :])
+    d = np.minimum(diff, 360.0 - diff)              # circular hue distance
+    w = np.exp(-(d * d) / (2.0 * sigma * sigma))    # (H, W, 8)
+
+    m = np.sum(w * mults, axis=-1) / np.sum(w, axis=-1)   # weighted avg (denom never 0)
+
+    s = np.clip(s * m, 0, 255)
+    return cv2.cvtColor(cv2.merge([h, s, v]).astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -312,19 +443,7 @@ class Enhancer:
         Vibrance = adaptive saturation: boosts dull colors more, protects
         already-saturated areas (like skin tones) from over-saturation.
         """
-        sat = self.cfg['saturation']
-        vib = self.cfg['vibrance']
-        if abs(sat - 1.0) < 0.01 and vib < 0.01:
-            return frame
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-        h, s, v = cv2.split(hsv)
-
-        # Vibrance boost: more effect on low-saturation pixels
-        vib_boost = 1.0 + vib * (1.0 - s / 255.0)
-        s = np.clip(s * sat * vib_boost, 0, 255)
-
-        return cv2.cvtColor(cv2.merge([h, s, v]).astype(np.uint8), cv2.COLOR_HSV2BGR)
+        return apply_chroma(frame, self.cfg['saturation'], self.cfg['vibrance'])
 
     # ── Step 5: Super Resolution / Upscale ──────────────────────
 
@@ -712,9 +831,14 @@ def probe_video(path: str) -> dict:
 
 
 def make_reader(path: str, vf: str = None,
-                start_time: float = None, end_time: float = None) -> subprocess.Popen:
+                start_time: float = None, end_time: float = None,
+                out_fps: float = None) -> subprocess.Popen:
     """
     Open an FFmpeg pipe reader with optional trim and crop filter.
+
+    out_fps: if set, FFmpeg resamples (dup/drop) the decoded frames to this
+    constant rate before piping. Used by the montage builder so every clip is
+    delivered at one common fps — the resulting temp clips then concat losslessly.
 
     GPU note: We use -hwaccel cuda (assists decode) but NOT
     -hwaccel_output_format cuda. Keeping frames in CPU memory avoids
@@ -759,6 +883,10 @@ def make_reader(path: str, vf: str = None,
     if vf:
         cmd += ['-vf', vf]
 
+    # Normalise output frame rate (dup/drop) so all montage clips share one fps
+    if out_fps is not None:
+        cmd += ['-r', f'{out_fps:.6f}']
+
     cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
     return subprocess.Popen(
         cmd,
@@ -768,23 +896,31 @@ def make_reader(path: str, vf: str = None,
 
 
 def make_writer(path: str, w: int, h: int, fps: float,
-                audio_src: str, crf: int, bitrate: str) -> subprocess.Popen:
+                audio_src: str, crf: int, bitrate: str,
+                silent: bool = False) -> subprocess.Popen:
     ffmpeg = find_tool('ffmpeg')
     buf = f"{int(bitrate.rstrip('M')) * 2}M"
     return subprocess.Popen(
-        _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path),
+        _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path, silent),
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
         **_POPEN_KWARGS
     )
 
 
-def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path):
-    """Build FFmpeg writer command — NVENC if GPU available, libx265 CPU fallback."""
+def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path, silent=False):
+    """
+    Build FFmpeg writer command — NVENC if GPU available, libx265 CPU fallback.
+    silent=True drops audio entirely (no audio input mapped) — used for montage
+    temp clips so the concatenated output is silent.
+    """
     base = [ffmpeg, '-v', 'quiet', '-y',
             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-            '-s', f'{w}x{h}', '-r', str(fps), '-i', 'pipe:0',
-            '-i', audio_src,
-            '-map', '0:v', '-map', '1:a?']
+            '-s', f'{w}x{h}', '-r', str(fps), '-i', 'pipe:0']
+    if silent:
+        maps = ['-map', '0:v']
+    else:
+        base += ['-i', audio_src]
+        maps = ['-map', '0:v', '-map', '1:a?']
 
     if GPU['nvenc']:
         # NVENC: hardware H.265 encode — 5-10× faster than libx265 CPU
@@ -804,12 +940,12 @@ def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path):
 
     tail = ['-pix_fmt', 'yuv420p',
             '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
-            '-tag:v', 'hvc1',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', '+faststart',
-            path]
+            '-tag:v', 'hvc1']
+    if not silent:
+        tail += ['-c:a', 'aac', '-b:a', '192k']
+    tail += ['-movflags', '+faststart', path]
 
-    return base + enc + tail
+    return base + maps + enc + tail
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -841,9 +977,17 @@ def fmt_time(s: float) -> str:
     return f"{m}:{s % 60:05.2f}"
 
 
-def process_video(input_path: str, output_path: str, cfg: dict):
+def process_video(input_path: str, output_path: str, cfg: dict,
+                  silent: bool = False, force_fps: float = None):
+    """
+    Process one video → enhanced 1080×1920 H.265.
+    silent=True drops audio; force_fps resamples to a constant rate. Both are
+    used by the montage builder (process_sequence) so temp clips concat cleanly;
+    defaults preserve the original single-video behaviour exactly.
+    """
     info = probe_video(input_path)
     fps, w, h = info['fps'], info['width'], info['height']
+    out_fps = force_fps if force_fps else fps   # encode/resample rate
     total_duration = info['duration']
 
     # ── Time window ───────────────────────────────────────────────
@@ -864,7 +1008,7 @@ def process_video(input_path: str, output_path: str, cfg: dict):
     seg_start    = start_t or 0.0
     seg_end      = end_t   or total_duration
     seg_duration = seg_end - seg_start
-    seg_frames   = int(round(seg_duration * fps))
+    seg_frames   = int(round(seg_duration * out_fps))   # frames actually delivered
 
     scale = cfg.get('upscale', 1.0)
     out_w, out_h = int(w * scale), int(h * scale)
@@ -923,7 +1067,8 @@ def process_video(input_path: str, output_path: str, cfg: dict):
 
     print(f"  Input   {w}×{h}  {fps:.2f}fps  {info['codec'].upper()}{tw_label}")
     ig_note = "  ✅ IG Stories spec" if (out_w, out_h) == (1080, 1920) else ""
-    print(f"  Output  {out_w}×{out_h}  {fps:.2f}fps  H.265/HEVC  (Apple HVC1){ig_note}")
+    audio_note = "  (silent)" if silent else ""
+    print(f"  Output  {out_w}×{out_h}  {out_fps:.2f}fps  H.265/HEVC  (Apple HVC1){ig_note}{audio_note}")
 
     if crop_info:
         quality = "lossless" if crop_info['scale'] <= 1.0 else f"{crop_info['scale']:.2f}× upscale"
@@ -956,9 +1101,11 @@ def process_video(input_path: str, output_path: str, cfg: dict):
     else:
         frame_w, frame_h = w, h           # full frame (Python crops per-frame)
     frame_bytes = frame_w * frame_h * 3
-    reader = make_reader(input_path, vf=vf_filter, start_time=start_t, end_time=end_t)
-    writer = make_writer(output_path, out_w, out_h, fps,
-                         input_path, cfg['output_crf'], cfg['output_bitrate'])
+    reader = make_reader(input_path, vf=vf_filter, start_time=start_t, end_time=end_t,
+                         out_fps=force_fps)
+    writer = make_writer(output_path, out_w, out_h, out_fps,
+                         input_path, cfg['output_crf'], cfg['output_bitrate'],
+                         silent=silent)
 
     n = 0
     total = seg_frames  # progress bar relative to segment, not full clip
@@ -986,6 +1133,10 @@ def process_video(input_path: str, output_path: str, cfg: dict):
                                        interpolation=cv2.INTER_LANCZOS4)
 
             out   = enhancer.process(frame)
+            # Honour force_resolution when no crop/upscale already produced it
+            # (e.g. landscape source → 9:16): cover-fit to the writer's size.
+            if out.shape[1] != out_w or out.shape[0] != out_h:
+                out = fit_cover(out, out_w, out_h)
             out   = temporal.process(out)
             writer.stdin.write(out.tobytes())
 
@@ -1055,13 +1206,71 @@ def load_image(path: str) -> np.ndarray:
     return img
 
 
+def sharpen_image(frame: np.ndarray, amount: float) -> np.ndarray:
+    """
+    Light unsharp mask for stills, applied after the resize.
+    Big downscales (e.g. a 26MP pano → 1080px) soften fine detail; a touch of
+    USM restores the 'crisp' look without the heavy multi-layer video sharpen.
+    amount ≈ 0.4–0.8 is a good range; 0 disables.
+    """
+    if amount <= 0.01:
+        return frame
+    blur = cv2.GaussianBlur(frame, (0, 0), 1.0)
+    return cv2.addWeighted(frame, 1.0 + amount, blur, -amount, 0)
+
+
+def _convert_to_srgb(out_bgr: np.ndarray, src_path: str):
+    """
+    Colour-manage `out_bgr` into sRGB using the source image's embedded ICC
+    profile (via Pillow + littleCMS). Returns (rgb_uint8, srgb_icc_bytes) on
+    success, or None if Pillow/ImageCms is unavailable (caller falls back).
+    If the source has no profile we assume it is already sRGB and just tag it.
+    """
+    try:
+        import io
+        from PIL import Image, ImageCms
+    except ImportError:
+        print("  ⚠️  --srgb needs Pillow — skipping conversion (pip install pillow)")
+        return None
+
+    rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    srgb_profile = ImageCms.createProfile('sRGB')
+
+    src_icc = None
+    try:
+        with Image.open(src_path) as s:
+            src_icc = s.info.get('icc_profile')
+    except Exception:
+        pass
+
+    if src_icc:
+        try:
+            src_profile = ImageCms.ImageCmsProfile(io.BytesIO(src_icc))
+            pil = ImageCms.profileToProfile(pil, src_profile, srgb_profile, outputMode='RGB')
+        except Exception as e:
+            print(f"  ⚠️  ICC transform failed ({e}); tagging as sRGB without conversion")
+
+    icc_bytes = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+    return np.asarray(pil), icc_bytes
+
+
 def process_image(input_path: str, output_path: str, cfg: dict):
     """
-    Still-image pipeline: crop a 9:16 vertical window then resize to
-    exactly 1080×1920. No color, sharpening, denoise, or enhancement is
-    applied — the cropped/resized pixels are saved as-is.
-    Crop uses the same compute_crop() as video (crop_position respected;
-    crop_position_end is irrelevant for a single still).
+    Still-image pipeline: crop a 9:16 window then resize to exactly 1080×1920.
+
+    Optional, off by default:
+      - sharpen    (cfg['sharpen_amount'] / --sharpen)     light USM after resize
+      - temperature(cfg['temperature']    / --temperature) warm/cool white balance
+      - saturation (cfg['saturation']     / --saturation)  HSV saturation multiplier
+      - vibrance   (cfg['vibrance']       / --vibrance)     adaptive saturation boost
+      - hue-sat    (cfg['sat_bands']      / --sat-COLOR)    per-colour saturation
+      - quality    (cfg['out_quality']    / --quality)      JPEG quality (default 97)
+      - sRGB       (cfg['srgb']           / --srgb)         colour-manage to sRGB
+
+    Crop uses the same compute_crop() as video: for landscape sources
+    crop_position pans horizontally; for tall/portrait sources (this DJI pano)
+    it selects the vertical window ('top'/'bottom'/'center'/int).
     """
     img = load_image(input_path)
     src_h, src_w = img.shape[:2]
@@ -1070,6 +1279,13 @@ def process_image(input_path: str, output_path: str, cfg: dict):
     target_w = cfg.get('crop_target_w', 1080)
     target_h = cfg.get('crop_target_h', 1920)
     position = cfg.get('crop_position', 'center')
+    amount   = float(cfg.get('sharpen_amount', 0.0))
+    temp     = float(cfg.get('temperature', 0.0))
+    sat      = float(cfg.get('saturation', 1.0))
+    vib      = float(cfg.get('vibrance', 0.0))
+    bands    = cfg.get('sat_bands', {}) or {}
+    jpeg_q   = int(cfg.get('out_quality', 97))
+    want_srgb = bool(cfg.get('srgb', False))
 
     # Static crop only — total_frames=1 means get_crop_x() returns start_x
     crop_info = compute_crop(src_w, src_h, target_w, target_h, position)
@@ -1078,9 +1294,14 @@ def process_image(input_path: str, output_path: str, cfg: dict):
 
     cropped = img[cy:cy + ch, cx:cx + cw]
     out = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+    out = apply_temperature(out, temp)             # white balance first (fixes casts)
+    out = sharpen_image(out, amount)
+    out = apply_chroma(out, sat, vib)
+    out = apply_selective_saturation(out, bands)   # per-colour trim, after global sat
 
     out_ext = Path(output_path).suffix.lower()
-    quality = "lossless" if crop_info['scale'] <= 1.0 else f"{crop_info['scale']:.2f}× upscale"
+    scale_label = "lossless" if crop_info['scale'] <= 1.0 else f"{crop_info['scale']:.2f}× upscale"
+    axis = "vertical" if crop_info['vertical_crop'] else "horizontal"
 
     print(f"\n{'═'*62}")
     print(f"  🖼️   Image Processor  —  Crop → 9:16 Vertical")
@@ -1088,17 +1309,50 @@ def process_image(input_path: str, output_path: str, cfg: dict):
     ig_note = "  ✅ IG Stories spec" if (target_w, target_h) == (1080, 1920) else ""
     print(f"  Input   {src_w}×{src_h}  {in_ext.lstrip('.').upper()}")
     print(f"  Output  {target_w}×{target_h}  {out_ext.lstrip('.').upper()}{ig_note}")
-    print(f"  Crop    {cw}×{ch}  x={cx} y={cy}  ({position})  {quality}")
-    print(f"  Mode    Crop + Resize (Lanczos4) — no enhancement")
+    print(f"  Crop    {cw}×{ch}  x={cx} y={cy}  ({position}, {axis})  {scale_label}")
+    sharp_label = f"{amount:.2f}" if amount > 0.01 else "off"
+    q_label = f"q{jpeg_q}" if out_ext != '.png' else "PNG (lossless)"
+    temp_label = (f"{temp:+.2f} ({'cooler' if temp < 0 else 'warmer'})"
+                  if abs(temp) > 0.01 else "0 (neutral)")
+    print(f"  Resize  Lanczos4   Sharpen {sharp_label}   Temp {temp_label}")
+    print(f"  Colour  Sat {sat:.2f}   Vib {vib:.2f}")
+    if bands:
+        band_str = "  ".join(f"{c}={bands[c]:.2f}" for c in HUE_BANDS if c in bands)
+        print(f"  Hue-sat {band_str}")
+    print(f"  Output  {q_label}   sRGB {'on' if want_srgb else 'off'}")
     print(f"  Preset  {cfg.get('_name', 'image')}")
     print(f"  File    {output_path}")
     print(f"{'═'*62}\n")
 
-    # Save: high-quality JPEG (q=97) or PNG depending on output extension
-    if out_ext == '.png':
-        ok = cv2.imwrite(output_path, out, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    # ── Save ──────────────────────────────────────────────────────
+    # sRGB path goes through Pillow (so we can embed an ICC profile);
+    # otherwise use cv2.imwrite. JPEG uses 4:4:4 chroma (subsampling=0) for
+    # maximum crispness on fine coloured detail.
+    icc_bytes = None
+    if want_srgb:
+        conv = _convert_to_srgb(out, input_path)
+        if conv is not None:
+            rgb, icc_bytes = conv  # rgb is RGB uint8
+        else:
+            want_srgb = False      # Pillow missing → fall back to cv2
+
+    ok = False
+    if want_srgb:
+        from PIL import Image
+        pil = Image.fromarray(rgb)
+        if out_ext == '.png':
+            pil.save(output_path, format='PNG', icc_profile=icc_bytes)
+        else:
+            pil.save(output_path, format='JPEG', quality=jpeg_q,
+                     subsampling=0, icc_profile=icc_bytes)
+        ok = True
     else:
-        ok = cv2.imwrite(output_path, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
+        if out_ext == '.png':
+            ok = cv2.imwrite(output_path, out, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        else:
+            ok = cv2.imwrite(output_path, out,
+                             [cv2.IMWRITE_JPEG_QUALITY, jpeg_q,
+                              cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444])
 
     if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 100:
         kb = os.path.getsize(output_path) / 1e3
@@ -1106,6 +1360,161 @@ def process_image(input_path: str, output_path: str, cfg: dict):
         print(f"  📁  {output_path}  ({kb:.0f} KB)\n")
     else:
         print("  ⚠️  Failed to write output image.\n")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MONTAGE / SEQUENCE BUILDER
+# ══════════════════════════════════════════════════════════════════
+
+CLIP_MIN_SEC = 1.0   # ideal per-clip duration floor (snappy pacing)
+CLIP_MAX_SEC = 6.0   # ideal per-clip duration ceiling
+
+
+def sample_manifest_text() -> str:
+    """A ready-to-edit JSON manifest for the montage builder (--sequence)."""
+    sample = {
+        "output": "montage.mp4",
+        "fps": 30,
+        "defaults": {"preset": "instagram_stories"},
+        "clips": [
+            {"input": "clip_a.mp4", "start": 0,  "duration": 3},
+            {"input": "clip_b.mp4", "start": 12, "duration": 5,
+             "preset": "drone_stories", "crop_position": "left"},
+            {"input": "clip_c.mov", "start": 4,  "duration": 2,
+             "log": True, "sharpen": 0.5, "saturation": 1.1}
+        ]
+    }
+    return json.dumps(sample, indent=2)
+
+
+def load_manifest(path: str) -> dict:
+    """Load and lightly validate a montage manifest (JSON)."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"\n❌  Manifest not found: {path}\n")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"\n❌  Manifest is not valid JSON: {e}\n")
+        sys.exit(1)
+    if not isinstance(data, dict) or not isinstance(data.get('clips'), list) or not data['clips']:
+        print("\n❌  Manifest must be a JSON object with a non-empty 'clips' list.")
+        print("    Run  --print-sample-manifest  to see the expected format.\n")
+        sys.exit(1)
+    return data
+
+
+def build_clip_cfg(clip: dict, defaults: dict) -> dict:
+    """
+    Build a per-clip cfg from a preset plus manifest overrides (a clip's own
+    keys win over the manifest 'defaults'). Mirrors the single-video CLI flags.
+    """
+    merged = {**defaults, **clip}
+    preset = merged.get('preset', 'instagram_stories')
+    if preset not in PRESETS:
+        print(f"\n❌  Unknown preset '{preset}' for clip {clip.get('input')!r}.")
+        print(f"    Valid presets: {', '.join(PRESETS)}\n")
+        sys.exit(1)
+    cfg = PRESETS[preset].copy()
+
+    if merged.get('log'):                            cfg['is_log'] = True
+    if merged.get('crop_position') is not None:      cfg['crop_position'] = merged['crop_position']
+    if merged.get('crop_position_end') is not None:  cfg['crop_position_end'] = merged['crop_position_end']
+    if merged.get('easing'):                         cfg['crop_easing'] = merged['easing']
+    for mkey, cfgkey in (('sharpen', 'sharpen_amount'), ('denoise', 'denoise_strength'),
+                         ('saturation', 'saturation'), ('vibrance', 'vibrance'),
+                         ('upscale', 'upscale')):
+        if merged.get(mkey) is not None:
+            cfg[cfgkey] = merged[mkey]
+    return cfg
+
+
+def process_sequence(manifest_path: str, output_path: str = None):
+    """
+    Build a single silent montage from a JSON manifest of video clips.
+    Each clip is trimmed to a 1–6s window, processed to 1080×1920 H.265 at one
+    common fps (silent), then losslessly concatenated (stream copy).
+    """
+    manifest = load_manifest(manifest_path)
+    out_path = output_path or manifest.get('output')
+    if not out_path:
+        print("\n❌  No output path — pass it on the CLI or set 'output' in the manifest.\n")
+        sys.exit(1)
+
+    fps      = float(manifest.get('fps', 30))
+    defaults = manifest.get('defaults', {}) or {}
+    clips    = manifest['clips']
+
+    # ── Validate every clip up front (fail fast before any encoding) ──
+    specs, total = [], 0.0
+    for i, clip in enumerate(clips):
+        src = clip.get('input')
+        if not src:
+            print(f"\n❌  Clip {i} has no 'input'.\n");                       sys.exit(1)
+        if not os.path.exists(src):
+            print(f"\n❌  Clip {i}: input not found: {src}\n");               sys.exit(1)
+        if Path(src).suffix.lower() in IMAGE_EXTS:
+            print(f"\n❌  Clip {i}: '{src}' is an image — the montage is video-only.\n"); sys.exit(1)
+        if clip.get('duration') is None:
+            print(f"\n❌  Clip {i} ('{src}') has no 'duration'.\n");          sys.exit(1)
+        dur = float(clip['duration'])
+        clamped = max(CLIP_MIN_SEC, min(dur, CLIP_MAX_SEC))
+        if abs(clamped - dur) > 1e-6:
+            print(f"  ⚠️  Clip {i}: duration {dur:g}s clamped to {clamped:g}s (1–6s range).")
+        start = float(clip.get('start', 0) or 0)
+        specs.append((clip, src, start, clamped))
+        total += clamped
+
+    print(f"\n{'═'*62}")
+    print(f"  🎞️   Montage Builder  —  {len(specs)} clips → {total:.1f}s @ {fps:.0f}fps")
+    print(f"{'═'*62}")
+    for i, (_, src, start, dur) in enumerate(specs):
+        print(f"  {i+1:2}. {Path(src).name:<30} {fmt_time(start)} +{dur:g}s")
+    print(f"  Output  {out_path}   (silent)")
+    print(f"{'═'*62}")
+
+    # ── Render each clip to a silent, fps-normalised temp file ──
+    tmpdir = tempfile.mkdtemp(prefix='mp_seq_')
+    temp_files = []
+    try:
+        for i, (clip, src, start, dur) in enumerate(specs):
+            cfg = build_clip_cfg(clip, defaults)
+            cfg['start_time'] = start
+            cfg['end_time']   = start + dur
+            temp_out = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
+            print(f"\n  ── Clip {i+1}/{len(specs)} ──────────────────────────────")
+            process_video(src, temp_out, cfg, silent=True, force_fps=fps)
+            if not (os.path.exists(temp_out) and os.path.getsize(temp_out) > 1000):
+                print(f"\n❌  Clip {i+1} failed to render; aborting.\n")
+                sys.exit(1)
+            temp_files.append(temp_out)
+
+        # ── Concatenate (stream copy — every temp shares codec/params/fps) ──
+        list_path = os.path.join(tmpdir, 'concat.txt')
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for tf in temp_files:
+                f.write(f"file '{tf.replace(os.sep, '/')}'\n")
+
+        ffmpeg = find_tool('ffmpeg')
+        print(f"\n  Concatenating {len(temp_files)} clips…")
+        r = subprocess.run(
+            [ffmpeg, '-v', 'error', '-y', '-f', 'concat', '-safe', '0',
+             '-i', list_path, '-c', 'copy', '-movflags', '+faststart', out_path],
+            capture_output=True, text=True, **_POPEN_KWARGS
+        )
+        if r.returncode != 0:
+            print(f"\n❌  Concatenation failed:\n{r.stderr.strip()}\n")
+            sys.exit(1)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+        mb = os.path.getsize(out_path) / 1e6
+        print(f"\n  ✅  Montage complete: {len(temp_files)} clips, {total:.1f}s")
+        print(f"  📁  {out_path}  ({mb:.1f} MB)\n")
+    else:
+        print("\n  ⚠️  Montage output may be incomplete.\n")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1225,15 +1634,17 @@ PRESETS = {
         _name="image",
         description="Still image → crop 9:16 → 1080×1920 (crop+resize only, no enhancement)",
         drone_crop=True,
-        crop_position='center',   # 'center' | 'left' | 'right' | int (pixel x offset)
+        crop_position='center',   # horizontal for landscape, vertical for tall/portrait
         crop_target_w=1080, crop_target_h=1920,
         is_log=False, upscale=1.0,
-        # All enhancement off — image pipeline saves cropped/resized pixels as-is
+        # Enhancement off by default — opt in per image via CLI flags
         denoise_strength=0.0,                                      # neutralised
-        sharpen_amount=0.0, sharpen_radius=0.9, detail_amount=0.0, detail_inject=0.0,  # neutralised
+        sharpen_amount=0.0, sharpen_radius=0.9, detail_amount=0.0, detail_inject=0.0,  # off; --sharpen to enable
         local_contrast=False, clahe_clip=2.5, clahe_blend=0.0,     # neutralised
         saturation=1.0, vibrance=0.0,                              # neutralised
         temporal_blend=0.0,                                        # neutralised
+        out_quality=97,           # JPEG quality for image output (--quality)
+        srgb=False,               # colour-manage output to sRGB (--srgb)
         output_crf=16, output_bitrate="20M",
         force_resolution=(1080, 1920),
     ),
@@ -1261,7 +1672,25 @@ PRESETS
 EXAMPLES
   # Still image (JPEG/PNG/HEIC/TIFF/WebP) → crop center → 1080x1920
   python3 media_processor.py photo.jpg ig_story.jpg
-  python3 media_processor.py photo.heic ig_story.jpg --crop-position right
+
+  # Crispest IG Stories still: light sharpen + max-quality JPEG + sRGB
+  python3 media_processor.py photo.jpg ig_story.jpg --sharpen 0.6 --quality 100 --srgb
+
+  # Punchier colours: saturation + vibrance
+  python3 media_processor.py photo.jpg ig_story.jpg --saturation 1.2 --vibrance 0.3
+
+  # Boost overall saturation but tame warm tones (per-colour, Lightroom-style)
+  python3 media_processor.py photo.jpg ig_story.jpg --saturation 1.3 --sat-yellow 0.5 --sat-orange 0.7 --sat-red 0.8
+
+  # Neutralise an overall warm/yellow cast (cooler white balance)
+  python3 media_processor.py photo.jpg ig_story.jpg --temperature -0.3
+
+  # PNG (lossless source for IG's re-encoder)
+  python3 media_processor.py photo.jpg ig_story.png --sharpen 0.6
+
+  # Tall/portrait image (pano): crop-position selects the VERTICAL window
+  python3 media_processor.py pano.jpg ig_story.jpg --crop-position top
+  python3 media_processor.py pano.jpg ig_story.jpg --crop-position bottom
 
   # Standard iPhone video → IG Stories
   python3 media_processor.py clip.mp4 ig_story.mp4
@@ -1292,6 +1721,10 @@ EXAMPLES
 
   # Upscale 1080p → 4K
   python3 media_processor.py 1080p.mp4 4k_out.mp4 --preset upscale_2x
+
+  # MONTAGE: stitch 1–6s clips from a JSON manifest into one silent video
+  python3 media_processor.py --print-sample-manifest > clips.json   # then edit
+  python3 media_processor.py --sequence clips.json montage.mp4
         """
     )
 
@@ -1328,15 +1761,45 @@ EXAMPLES
                         help='Denoise strength')
     parser.add_argument('--sharpen',    type=float, metavar='0-1',
                         help='Sharpen amount')
+    parser.add_argument('--temperature', '--temp', type=float, metavar='-1..1', dest='temperature',
+                        help='White-balance temperature for images: negative = cooler/bluer '
+                             '(neutralises a warm/yellow cast), positive = warmer. 0 = neutral.')
     parser.add_argument('--saturation', type=float, metavar='MULT',
-                        help='Saturation multiplier (1.0=unchanged)')
+                        help='Saturation multiplier (1.0=unchanged). Works for video and images.')
+    parser.add_argument('--vibrance', type=float, metavar='0-1',
+                        help='Vibrance — adaptive saturation that boosts dull colours more '
+                             'and protects already-saturated areas (0=off). Video and images.')
+    hue_group = parser.add_argument_group(
+        'per-colour saturation (images only)',
+        'Multiply the saturation of specific hue bands, like Lightroom HSL. '
+        '1.0 = unchanged, <1 = less saturated, >1 = more. '
+        'e.g. tame warm tones: --sat-yellow 0.5 --sat-orange 0.7 --sat-red 0.8')
+    for _band in HUE_BANDS:
+        hue_group.add_argument(f'--sat-{_band}', type=float, metavar='MULT',
+                               help=f'Saturation multiplier for {_band} tones (1.0=unchanged)')
+    parser.add_argument('--quality', type=int, metavar='1-100',
+                        help='Image output JPEG quality (default 97). Images only; '
+                             'ignored for PNG output and for video.')
+    parser.add_argument('--srgb', action='store_true',
+                        help='Colour-manage image output to the sRGB profile using the '
+                             'source ICC profile (needs Pillow). Images only.')
+    parser.add_argument('--sequence', metavar='MANIFEST.json',
+                        help='Montage mode: stitch the 1–6s clips defined in a JSON '
+                             'manifest into one silent video. Output path is the '
+                             'positional arg or the manifest\'s "output" field.')
+    parser.add_argument('--print-sample-manifest', action='store_true',
+                        help='Print a sample --sequence JSON manifest and exit')
     parser.add_argument('--list-presets', action='store_true',
                         help='List all presets and exit')
 
     args = parser.parse_args()
 
+    if args.print_sample_manifest:
+        print(sample_manifest_text())
+        return
+
     if args.list_presets:
-        print("\n🎬  Video Upscaler — Presets\n")
+        print("\n🎬  Media Processor — Presets\n")
         for name, cfg in PRESETS.items():
             tags = []
             if cfg['is_log']:          tags.append('Log')
@@ -1344,6 +1807,11 @@ EXAMPLES
             tag_str = f"  [{', '.join(tags)}]" if tags else ""
             print(f"  {name:<28} {cfg['description']}{tag_str}")
         print()
+        return
+
+    # Montage mode — output is the positional arg (args.input) or manifest 'output'
+    if args.sequence:
+        process_sequence(args.sequence, args.input)
         return
 
     if not args.input or not args.output:
@@ -1367,7 +1835,15 @@ EXAMPLES
     if args.upscale is not None:    cfg['upscale'] = args.upscale
     if args.denoise is not None:    cfg['denoise_strength'] = args.denoise
     if args.sharpen is not None:    cfg['sharpen_amount'] = args.sharpen
+    if args.temperature is not None: cfg['temperature'] = args.temperature
     if args.saturation is not None: cfg['saturation'] = args.saturation
+    if args.vibrance is not None:   cfg['vibrance'] = args.vibrance
+    # Per-colour saturation (--sat-red, --sat-yellow, …) → cfg['sat_bands']
+    sat_bands = {b: getattr(args, f'sat_{b}') for b in HUE_BANDS
+                 if getattr(args, f'sat_{b}') is not None}
+    if sat_bands:                   cfg['sat_bands'] = sat_bands
+    if args.quality is not None:    cfg['out_quality'] = max(1, min(args.quality, 100))
+    if args.srgb:                   cfg['srgb'] = True
     if args.crop_position is not None:
         try:
             cfg['crop_position'] = int(args.crop_position)

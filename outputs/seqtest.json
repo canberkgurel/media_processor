@@ -1,0 +1,9 @@
+{
+  "fps": 30,
+  "defaults": { "preset": "instagram_stories" },
+  "clips": [
+    { "input": "outputs/seqtest_a.mp4", "start": 0, "duration": 3 },
+    { "input": "outputs/seqtest_b.mp4", "start": 2, "duration": 4, "preset": "drone_stories", "crop_position": "left" },
+    { "input": "outputs/seqtest_a.mp4", "start": 1, "duration": 9 }
+  ]
+}

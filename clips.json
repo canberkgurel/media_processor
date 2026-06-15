@@ -1,0 +1,29 @@
+﻿{
+  "output": "montage.mp4",
+  "fps": 30,
+  "defaults": {
+    "preset": "instagram_stories"
+  },
+  "clips": [
+    {
+      "input": "clip_a.mp4",
+      "start": 0,
+      "duration": 3
+    },
+    {
+      "input": "clip_b.mp4",
+      "start": 12,
+      "duration": 5,
+      "preset": "drone_stories",
+      "crop_position": "left"
+    },
+    {
+      "input": "clip_c.mov",
+      "start": 4,
+      "duration": 2,
+      "log": true,
+      "sharpen": 0.5,
+      "saturation": 1.1
+    }
+  ]
+}
