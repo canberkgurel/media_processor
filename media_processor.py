@@ -2,9 +2,10 @@
 """
 media_processor.py — Topaz-style Media Enhancement for iPhone 15 Pro Max footage
 ================================================================================
-Optimized for 4K 30fps video and still images → Instagram Stories output.
+Optimized for 4K 30fps video and still images → Instagram Stories (1080×1920,
+H.265) or YouTube (native resolution preserved, H.264, with audio).
 Still images (JPEG/PNG/HEIC/TIFF/WebP) are auto-detected and routed through a
-crop + resize-only pipeline; everything else is treated as video.
+crop + resize-only pipeline; everything else (incl. ProRes .MOV) is video.
 
 Pipeline (all vectorized, GPU-ready):
   1. Apple Log → Rec.709  (fast 256-entry LUT via cv2.LUT)
@@ -207,42 +208,71 @@ def compute_crop(src_w: int, src_h: int,
 #  COLOR SCIENCE  —  Apple Log → Rec.709
 # ══════════════════════════════════════════════════════════════════
 
-def build_apple_log_lut() -> np.ndarray:
-    """
-    Pre-compute a 256-entry Apple Log → Rec.709 lookup table.
-    Applied per-channel via cv2.LUT() — very fast (~14ms at 4K).
+# Apple Log is Apple's log transfer curve on **Rec.2020 primaries** (D65).
+# A correct conversion to Rec.709 is a colour-space transform, per Apple's spec:
+#   1. decode Apple Log signal → linear scene light (Rec.2020)
+#   2. gamut: linear Rec.2020 → linear Rec.709  (3×3 matrix, mixes channels)
+#   3. soft highlight roll-off (log scene-linear reaches ~12× diffuse white)
+#   4. Rec.709 OETF (gamma)
+# The old approach was a 1-D per-channel LUT, which CANNOT do step 2 — that is
+# why Apple Log footage came out pale/desaturated with lifted blacks.
 
-    Apple Log spec: logarithmic encoding with ~17 stops dynamic range.
-    Approximates the official Apple + Blackmagic Rec.709 transform.
-    """
-    x = np.arange(256, dtype=np.float64) / 255.0
+# Official Apple Log decode constants (signal V∈[0,1] → linear L; L=1.0 ≈ white)
+_AL_R0, _AL_RT = -0.05641088, 0.01
+_AL_C, _AL_BETA, _AL_GAMMA, _AL_DELTA = 47.28711236, 0.00964052, 0.08550479, 0.69336945
+_AL_PT = _AL_C * (_AL_RT - _AL_R0) ** 2
 
-    # Apple Log → linear light (inverse of Apple Log encoding)
-    c1, c2, c3 = 0.212639, 0.215180, 0.532400
-    linear = np.where(
-        x > 0.092864,
-        np.power(2.0, (x - c3) / c1) - c2,
-        (x - 0.092864) / 5.367655
-    )
-    linear = np.clip(linear, 0.0, 1.0)
 
-    # Linear → Rec.709 gamma (BT.709 OETF)
-    rec709 = np.where(
-        linear <= 0.018,
-        linear * 4.5,
-        1.099 * np.power(np.maximum(linear, 1e-10), 0.45) - 0.099
+def _apple_log_decode(v: np.ndarray) -> np.ndarray:
+    """Apple Log signal (0–1) → linear scene light in Rec.2020 (per Apple's spec)."""
+    return np.where(
+        v < _AL_PT,
+        np.sqrt(np.maximum(v, 0.0) / _AL_C) + _AL_R0,
+        np.power(2.0, (v - _AL_DELTA) / _AL_GAMMA) - _AL_BETA,
     )
 
-    return np.clip(rec709 * 255, 0, 255).astype(np.uint8)
 
+# 8-bit decode table (frames arrive as 8-bit BGR): code value → linear Rec.2020
+_APPLE_LOG_DECODE = _apple_log_decode(np.arange(256, dtype=np.float64) / 255.0).astype(np.float32)
 
-# Pre-compute at module load (shared across all frames)
-_LOG_LUT = build_apple_log_lut()
+# Linear Rec.2020 → linear Rec.709 gamut matrix, written for BGR channel order
+# (the standard RGB matrix with rows & columns reversed) so it applies directly
+# to our BGR frames via cv2.transform.
+_REC2020_TO_709_BGR = np.array([
+    [ 1.118730, -0.100579, -0.018151],   # → B
+    [-0.008349,  1.132900, -0.124550],   # → G
+    [-0.072850, -0.587641,  1.660491],   # → R
+], dtype=np.float32)
+
+_HL_KNEE = 0.80   # linear highlights above this are softly rolled off toward 1.0
+
+# Fast Rec.709 OETF lookup (avoids a per-pixel pow() at 4K)
+_OETF_N = 4096
+_oetf_x = np.linspace(0.0, 1.0, _OETF_N)
+_OETF_LUT = np.where(_oetf_x < 0.018, _oetf_x * 4.5,
+                     1.099 * np.power(_oetf_x, 0.45) - 0.099)
+_OETF_LUT = np.clip(_OETF_LUT * 255.0, 0, 255).astype(np.uint8)
 
 
 def apply_log_lut(frame_bgr: np.ndarray) -> np.ndarray:
-    """Apple Log → Rec.709 via pre-computed per-channel LUT. ~14ms at 4K."""
-    return cv2.LUT(frame_bgr, _LOG_LUT)
+    """
+    Apple Log → Rec.709, colour-managed: decode → Rec.2020→709 gamut matrix →
+    soft highlight roll-off → Rec.709 OETF. Restores proper blacks, contrast and
+    saturation that a 1-D LUT cannot. Input/output: BGR uint8.
+    """
+    lin = _APPLE_LOG_DECODE[frame_bgr]                 # (H,W,3) float32 linear, Rec.2020
+    lin = cv2.transform(lin, _REC2020_TO_709_BGR)      # → linear Rec.709 (gamut)
+    np.clip(lin, 0.0, None, out=lin)
+
+    # Soft-knee highlight roll-off: identity below the knee, compress toward 1.0 above
+    k = _HL_KNEE
+    over = lin > k
+    if over.any():
+        lin[over] = k + (1.0 - k) * np.tanh((lin[over] - k) / (1.0 - k))
+
+    # Rec.709 OETF via fast table
+    idx = np.clip(lin, 0.0, 1.0) * (_OETF_N - 1)
+    return _OETF_LUT[idx.astype(np.int32)]
 
 
 def apply_chroma(frame: np.ndarray, sat: float, vib: float) -> np.ndarray:
@@ -594,17 +624,6 @@ class GpuEnhancer:
             cv2.CV_32FC1, cv2.CV_32FC1, (7, 7), 2.0
         )
 
-        # Pre-upload LUT to GPU
-        self._lut_gpu = cv2.cuda_GpuMat()
-        self._lut_gpu.upload(_LOG_LUT.reshape(1, 256, 1))
-
-    # ── Log LUT ──
-
-    def apply_log_lut_gpu(self, gpu_frame: cv2.cuda_GpuMat) -> cv2.cuda_GpuMat:
-        """Apply Apple Log → Rec.709 LUT on GPU."""
-        # cv2.cuda.LUT operates per channel
-        return cv2.cuda.LUT(gpu_frame, self._lut_gpu)
-
     # ── Denoise ──
 
     def denoise(self, gpu_frame: cv2.cuda_GpuMat) -> cv2.cuda_GpuMat:
@@ -734,11 +753,14 @@ class GpuEnhancer:
 
     def process(self, frame: np.ndarray) -> np.ndarray:
         """Upload → GPU pipeline → download. One PCIe round-trip per frame."""
+        # Apple Log → Rec.709 is a colour-managed transform (gamut matrix +
+        # tone roll-off) done on the CPU before upload; a per-channel GPU LUT
+        # can't do the Rec.2020→709 gamut step correctly.
+        if self.cfg['is_log']:
+            frame = apply_log_lut(frame)
+
         gpu = cv2.cuda_GpuMat()
         gpu.upload(frame)
-
-        if self.cfg['is_log']:
-            gpu = self.apply_log_lut_gpu(gpu)
 
         gpu = self.denoise(gpu)
 
@@ -897,21 +919,26 @@ def make_reader(path: str, vf: str = None,
 
 def make_writer(path: str, w: int, h: int, fps: float,
                 audio_src: str, crf: int, bitrate: str,
-                silent: bool = False) -> subprocess.Popen:
+                silent: bool = False, vcodec: str = 'h265',
+                audio_ss: float = None, audio_t: float = None) -> subprocess.Popen:
     ffmpeg = find_tool('ffmpeg')
     buf = f"{int(bitrate.rstrip('M')) * 2}M"
     return subprocess.Popen(
-        _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path, silent),
+        _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path,
+                          silent, vcodec, audio_ss, audio_t),
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
         **_POPEN_KWARGS
     )
 
 
-def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path, silent=False):
+def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path,
+                      silent=False, vcodec='h265', audio_ss=None, audio_t=None):
     """
-    Build FFmpeg writer command — NVENC if GPU available, libx265 CPU fallback.
-    silent=True drops audio entirely (no audio input mapped) — used for montage
-    temp clips so the concatenated output is silent.
+    Build FFmpeg writer command — NVENC if GPU available, CPU library otherwise.
+    vcodec='h265' (IG Stories, Apple HVC1) or 'h264' (most compatible — YouTube).
+    silent=True drops audio entirely (used for montage temp clips).
+    audio_ss/audio_t trim the muxed audio to the processed video's time window
+    (so a trimmed clip's audio matches its video instead of running full length).
     """
     base = [ffmpeg, '-v', 'quiet', '-y',
             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
@@ -919,28 +946,37 @@ def _build_writer_cmd(ffmpeg, w, h, fps, audio_src, crf, bitrate, buf, path, sil
     if silent:
         maps = ['-map', '0:v']
     else:
+        # Trim the audio input to the same window as the video (before -i = fast/accurate)
+        if audio_ss is not None:
+            base += ['-ss', f'{audio_ss:.3f}']
+        if audio_t is not None:
+            base += ['-t', f'{audio_t:.3f}']
         base += ['-i', audio_src]
         maps = ['-map', '0:v', '-map', '1:a?']
 
-    if GPU['nvenc']:
-        # NVENC: hardware H.265 encode — 5-10× faster than libx265 CPU
-        # rc=vbr + cq maps to quality-equivalent of CPU CRF
-        enc = ['-c:v', 'hevc_nvenc',
-               '-preset', 'p4',           # NVENC quality preset (p1=fast, p7=best)
-               '-rc', 'vbr',
-               '-cq', str(crf),           # quality target (same scale as CRF)
-               '-b:v', bitrate,
-               '-maxrate', f'{int(bitrate.rstrip("M"))*2}M',
-               '-bufsize', buf]
+    maxrate2 = f'{int(bitrate.rstrip("M")) * 2}M'
+    if vcodec == 'h264':
+        # H.264 / AVC — maximum compatibility (YouTube's recommended upload codec)
+        if GPU['nvenc']:
+            enc = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', str(crf),
+                   '-b:v', bitrate, '-maxrate', maxrate2, '-bufsize', buf]
+        else:
+            enc = ['-c:v', 'libx264', '-preset', 'medium', '-crf', str(crf),
+                   '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', buf]
+        vtag = []  # default avc1 tag is correct for H.264 in mp4
     else:
-        # CPU fallback
-        enc = ['-c:v', 'libx265', '-preset', 'medium',
-               '-crf', str(crf),
-               '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', buf]
+        # H.265 / HEVC — efficient, tagged hvc1 for Apple/IG compatibility
+        if GPU['nvenc']:
+            enc = ['-c:v', 'hevc_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', str(crf),
+                   '-b:v', bitrate, '-maxrate', maxrate2, '-bufsize', buf]
+        else:
+            enc = ['-c:v', 'libx265', '-preset', 'medium', '-crf', str(crf),
+                   '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', buf]
+        vtag = ['-tag:v', 'hvc1']
 
     tail = ['-pix_fmt', 'yuv420p',
-            '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
-            '-tag:v', 'hvc1']
+            '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709']
+    tail += vtag
     if not silent:
         tail += ['-c:a', 'aac', '-b:a', '192k']
     tail += ['-movflags', '+faststart', path]
@@ -1065,10 +1101,14 @@ def process_video(input_path: str, output_path: str, cfg: dict,
     else:
         tw_label = f"  ({info['duration']:.1f}s  {info['frames']} frames)"
 
+    vcodec = cfg.get('output_codec', 'h265')
+    codec_label = "H.264/AVC" if vcodec == 'h264' else "H.265/HEVC  (Apple HVC1)"
     print(f"  Input   {w}×{h}  {fps:.2f}fps  {info['codec'].upper()}{tw_label}")
-    ig_note = "  ✅ IG Stories spec" if (out_w, out_h) == (1080, 1920) else ""
+    spec_note = ("  ✅ IG Stories spec" if (out_w, out_h) == (1080, 1920)
+                 else "  ✅ YouTube 1080p" if (out_w, out_h) == (1920, 1080)
+                 else "  ✅ YouTube 4K" if (out_w, out_h) == (3840, 2160) else "")
     audio_note = "  (silent)" if silent else ""
-    print(f"  Output  {out_w}×{out_h}  {out_fps:.2f}fps  H.265/HEVC  (Apple HVC1){ig_note}{audio_note}")
+    print(f"  Output  {out_w}×{out_h}  {out_fps:.2f}fps  {codec_label}{spec_note}{audio_note}")
 
     if crop_info:
         quality = "lossless" if crop_info['scale'] <= 1.0 else f"{crop_info['scale']:.2f}× upscale"
@@ -1084,7 +1124,10 @@ def process_video(input_path: str, output_path: str, cfg: dict,
           f"Sat {cfg['saturation']:.2f}")
     print(f"  Bitrate {cfg['output_bitrate']}  CRF {cfg['output_crf']}")
     print(f"  Accel   {accel}")
-    enc_label = "NVENC (GPU)" if GPU['nvenc'] else "libx265 (CPU)"
+    if GPU['nvenc']:
+        enc_label = f"{'h264_nvenc' if vcodec == 'h264' else 'hevc_nvenc'} (GPU)"
+    else:
+        enc_label = f"{'libx264' if vcodec == 'h264' else 'libx265'} (CPU)"
     dec_label = "NVDEC (GPU)" if GPU['nvdec'] else "CPU"
     print(f"  Encode  {enc_label}  |  Decode {dec_label}")
     print(f"  File    {output_path}")
@@ -1101,11 +1144,18 @@ def process_video(input_path: str, output_path: str, cfg: dict,
     else:
         frame_w, frame_h = w, h           # full frame (Python crops per-frame)
     frame_bytes = frame_w * frame_h * 3
+    # Trim muxed audio to the processed window only when a time window is set
+    if start_t is not None or end_t is not None:
+        aud_ss, aud_t = seg_start, seg_duration
+    else:
+        aud_ss, aud_t = None, None
+
     reader = make_reader(input_path, vf=vf_filter, start_time=start_t, end_time=end_t,
                          out_fps=force_fps)
     writer = make_writer(output_path, out_w, out_h, out_fps,
                          input_path, cfg['output_crf'], cfg['output_bitrate'],
-                         silent=silent)
+                         silent=silent, vcodec=cfg.get('output_codec', 'h265'),
+                         audio_ss=aud_ss, audio_t=aud_t)
 
     n = 0
     total = seg_frames  # progress bar relative to segment, not full clip
@@ -1627,6 +1677,57 @@ PRESETS = {
         force_resolution=(1080, 1920),
     ),
 
+    # ── YouTube (keeps native resolution + aspect, H.264, keeps audio) ──
+    # No forced resolution and no crop: the source resolution is preserved, so
+    # 4K stays 4K (never downscaled). H.264 is YouTube's recommended upload
+    # codec; pass --codec h265 for a smaller master. Quality is CRF-driven with
+    # a generous bitrate cap (ample headroom for 4K).
+
+    "youtube": dict(
+        _name="youtube",
+        description="→ YouTube, native resolution preserved (H.264, AAC). 4K stays 4K",
+        is_log=False, upscale=1.0,
+        # Enhancement off by default — add explicitly via CLI flags per clip
+        denoise_strength=0.0,                                      # neutralised
+        sharpen_amount=0.0, sharpen_radius=0.9, detail_amount=0.0, detail_inject=0.0,  # off; --sharpen to enable
+        local_contrast=False, clahe_clip=2.5, clahe_blend=0.0,     # neutralised
+        saturation=1.0, vibrance=0.0,                              # neutralised
+        temporal_blend=0.0,                                        # neutralised
+        # CRF 18 ≈ visually lossless; 60 Mbps cap leaves headroom up to 4K
+        output_crf=18, output_bitrate="60M",
+        output_codec="h264",
+        # No force_resolution → output matches the source resolution exactly
+    ),
+
+    "youtube_log": dict(
+        _name="youtube_log",
+        description="Apple Log (ProRes .MOV) → Rec.709 → YouTube, native res (H.264)",
+        is_log=True, upscale=1.0,
+        denoise_strength=0.0,                                      # neutralised
+        sharpen_amount=0.0, sharpen_radius=1.0, detail_amount=0.0, detail_inject=0.0,  # off; --sharpen to enable
+        local_contrast=False, clahe_clip=2.8, clahe_blend=0.0,     # neutralised
+        saturation=1.0, vibrance=0.0,                              # neutralised
+        temporal_blend=0.0,                                        # neutralised
+        output_crf=18, output_bitrate="60M",
+        output_codec="h264",
+        # No force_resolution → preserves the ProRes source resolution (e.g. 4K)
+    ),
+
+    "youtube_4k": dict(
+        _name="youtube_4k",
+        description="→ YouTube 4K, standardised to 3840×2160 (upscales smaller sources)",
+        is_log=False, upscale=1.0,
+        denoise_strength=0.0,                                      # neutralised
+        sharpen_amount=0.0, sharpen_radius=1.0, detail_amount=0.0, detail_inject=0.0,  # off; --sharpen to enable
+        local_contrast=False, clahe_clip=2.5, clahe_blend=0.0,     # neutralised
+        saturation=1.0, vibrance=0.0,                              # neutralised
+        temporal_blend=0.0,                                        # neutralised
+        # 45 Mbps ≈ YouTube's 2160p30 upload spec
+        output_crf=18, output_bitrate="45M",
+        output_codec="h264",
+        force_resolution=(3840, 2160),   # 4K floor: cover-fit smaller sources up to 4K
+    ),
+
     # ── Still image → IG Stories ───────────────────────────────────
     # Auto-selected for image inputs (.jpg/.png/.heic/.tif/.webp …).
     # Crop a 9:16 vertical window then resize to 1080×1920 — no enhancement.
@@ -1722,6 +1823,13 @@ EXAMPLES
   # Upscale 1080p → 4K
   python3 media_processor.py 1080p.mp4 4k_out.mp4 --preset upscale_2x
 
+  # YouTube, native resolution preserved (4K stays 4K), H.264, keeps audio
+  python3 media_processor.py clip.mov yt.mp4 --preset youtube
+  # iPhone ProRes Log 4K .MOV → Rec.709 → YouTube at native 4K
+  python3 media_processor.py IMG_7971.MOV yt.mp4 --preset youtube_log
+  # Smaller master: same but H.265
+  python3 media_processor.py IMG_7971.MOV yt.mp4 --preset youtube_log --codec h265
+
   # MONTAGE: stitch 1–6s clips from a JSON manifest into one silent video
   python3 media_processor.py --print-sample-manifest > clips.json   # then edit
   python3 media_processor.py --sequence clips.json montage.mp4
@@ -1734,6 +1842,9 @@ EXAMPLES
                         default='instagram_stories', metavar='PRESET')
     parser.add_argument('--log',        action='store_true',
                         help='Input is Apple Log → applies Rec.709 LUT')
+    parser.add_argument('--codec', choices=['h264', 'h265'], default=None,
+                        help='Output video codec: h264 (most compatible — YouTube) '
+                             'or h265 (efficient — IG/Apple). Overrides the preset.')
     parser.add_argument('--crop-position', default=None,
                         metavar='center|left|right|INT',
                         help='Crop start position for drone mode (default: center). '
@@ -1832,6 +1943,7 @@ EXAMPLES
 
     # CLI overrides
     if args.log:                    cfg['is_log'] = True
+    if args.codec is not None:      cfg['output_codec'] = args.codec
     if args.upscale is not None:    cfg['upscale'] = args.upscale
     if args.denoise is not None:    cfg['denoise_strength'] = args.denoise
     if args.sharpen is not None:    cfg['sharpen_amount'] = args.sharpen

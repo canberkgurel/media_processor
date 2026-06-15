@@ -1,9 +1,10 @@
 # media_processor
 
-Topaz-style media enhancement for iPhone 15 Pro Max footage, optimized for **Instagram Stories** output (1080×1920, H.265/HEVC). Handles both **video** and **still images**.
+Topaz-style media enhancement for iPhone footage. Exports to **Instagram Stories** (1080×1920, H.265) **or YouTube** (native resolution preserved — 4K stays 4K — H.264 with audio). Handles **video** and **still images**.
 
-- **Video** → Apple Log → Rec.709 LUT, adaptive denoise, detail sharpening, local contrast (CLAHE), chroma, temporal coherence, H.265 encode (NVENC/NVDEC GPU-accelerated when available, libx265/CPU fallback).
+- **Video** → Apple Log → Rec.709 LUT, adaptive denoise, detail sharpening, local contrast (CLAHE), chroma, temporal coherence, H.265/H.264 encode (NVENC/NVDEC GPU-accelerated when available, libx26x/CPU fallback). Any FFmpeg-readable container works, including iPhone **ProRes `.MOV`** (extension matching is case-insensitive — `.MOV`/`.mov`).
 - **Still images** (JPEG/PNG/HEIC/TIFF/WebP) → auto-detected and routed through a **crop + resize-only** pipeline (no enhancement) to exactly 1080×1920.
+- **Montage** → stitch 1–6 s clips from a JSON manifest into one silent video (`--sequence`).
 
 All enhancement is **neutral by default** — presets ship with sharpening, saturation, denoise, CLAHE, etc. turned off. Add enhancement explicitly per clip via CLI flags (`--sharpen`, `--denoise`, `--saturation`, …).
 
@@ -104,6 +105,23 @@ python media_processor.py drone.mp4 out.mp4 --preset drone_stories --sharpen 0.7
 python media_processor.py 1080p.mp4 4k_out.mp4 --preset upscale_2x
 ```
 
+### YouTube (native resolution preserved, H.264, keeps audio)
+```bash
+# Any landscape clip → YouTube, resolution unchanged (4K stays 4K)
+python media_processor.py clip.mov yt.mp4 --preset youtube
+
+# iPhone ProRes Log 4K .MOV → Rec.709 → YouTube at native 4K
+python media_processor.py "H:\iPhone Media\IMG_7971.MOV" yt.mp4 --preset youtube_log
+
+# Smaller master with the same quality target: switch to H.265
+python media_processor.py IMG_7971.MOV yt.mp4 --preset youtube_log --codec h265
+
+# Force/standardise to 4K (upscales smaller sources up to 3840×2160)
+python media_processor.py clip1080.mp4 yt.mp4 --preset youtube_4k
+```
+
+> `youtube`/`youtube_log` **never downscale** — they keep the source's exact resolution and aspect. `youtube_4k` standardises to 3840×2160 (cover-fit). All YouTube presets keep audio.
+
 ### Montage — stitch multiple clips into one video
 
 Define an ordered list of 1–6 second clips in a JSON manifest and export a single
@@ -148,6 +166,9 @@ Manifest format:
 | `neutral_log` | Log → Rec.709 only, minimal processing (preserve for grading) |
 | `drone_stories` | 4K/2.7K landscape drone → crop 9:16 → 1080×1920 |
 | `drone_stories_log` | 4K/2.7K landscape drone (Apple Log) → crop 9:16 → 1080×1920 |
+| `youtube` | → YouTube, **native resolution preserved** (H.264, AAC). 4K stays 4K |
+| `youtube_log` | Apple Log (ProRes `.MOV`) → Rec.709 → YouTube, native res (H.264) |
+| `youtube_4k` | → YouTube 4K, standardised to 3840×2160 (upscales smaller sources) |
 | `image` | Still image → crop 9:16 → 1080×1920 (crop+resize only; auto-selected for image inputs) |
 
 Run `python media_processor.py --list-presets` for the live list.
@@ -158,6 +179,7 @@ Run `python media_processor.py --list-presets` for the live list.
 |---|---|
 | `--preset PRESET` | Preset to start from (default `instagram_stories`) |
 | `--log` | Treat input as Apple Log → apply Rec.709 LUT |
+| `--codec h264\|h265` | Output video codec — overrides the preset (h264 = YouTube-friendly, h265 = efficient/IG) |
 | `--crop-position center\|left\|right\|top\|bottom\|INT` | Crop position. Landscape sources pan **horizontally**; tall/portrait sources select the **vertical** window |
 | `--crop-position-end center\|left\|right\|INT` | Crop end position → animated pan (video) |
 | `--easing linear\|ease_in_out` | Pan animation curve |
@@ -183,6 +205,8 @@ Run `python media_processor.py --list-presets` for the live list.
 
 ## Notes
 
+- **YouTube output:** `youtube`/`youtube_log` preserve the source's native resolution and aspect (no crop, no downscale), so 4K ProRes exports at 4K. H.264 is the default (YouTube's recommended codec); `--codec h265` makes a smaller master. Quality is CRF-driven with a generous bitrate cap.
+- **Audio + trimming:** when you trim with `--start-time`/`--end-time`, the muxed audio is now trimmed to the same window (previously the full-length audio was kept, leaving video and audio mismatched).
 - **Fitting to 1080×1920:** presets that force the IG-Stories resolution now *actually* resize non-matching sources with a **cover fit** (scale to fill 9:16, centre-crop the overflow) rather than only relabelling the size. A 16:9 clip therefore fills the vertical frame with the sides cropped. For explicit framing control on landscape footage, use `--preset drone_stories` with `--crop-position`.
 - **Montage:** `--sequence manifest.json` builds one silent 1080×1920 video from ordered 1–6 s clips (durations auto-clamped to 1–6 s). All clips are normalised to one fps and concatenated losslessly; `--print-sample-manifest` prints a starter file.
 - **Crop orientation is automatic:** if the source is wider than 9:16 the crop window is narrower than the frame and `--crop-position` pans horizontally (`left`/`right`/`center`/pixel-x). If the source is taller than 9:16 (e.g. a vertical pano) the window spans the full width and `--crop-position` selects the vertical slice (`top`/`bottom`/`center`/pixel-y).
