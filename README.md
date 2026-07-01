@@ -5,6 +5,7 @@ Topaz-style media enhancement for iPhone footage. Exports to **Instagram Stories
 - **Video** → Apple Log → Rec.709 LUT, adaptive denoise, detail sharpening, local contrast (CLAHE), chroma, temporal coherence, H.265/H.264 encode (NVENC/NVDEC GPU-accelerated when available, libx26x/CPU fallback). Any FFmpeg-readable container works, including iPhone **ProRes `.MOV`** (extension matching is case-insensitive — `.MOV`/`.mov`).
 - **Still images** (JPEG/PNG/HEIC/TIFF/WebP) → auto-detected and routed through a **crop + resize-only** pipeline (no enhancement) to exactly 1080×1920.
 - **Montage** → stitch 1–6 s clips from a JSON manifest into one silent video (`--sequence`).
+- **Grid tour** → arrange photos/videos in a grid, then zoom into each tile at full resolution and back out — IG Story (1080×1920) or Post (1080×1350) (`--grid`).
 
 All enhancement is **neutral by default** — presets ship with sharpening, saturation, denoise, CLAHE, etc. turned off. Add enhancement explicitly per clip via CLI flags (`--sharpen`, `--denoise`, `--saturation`, …).
 
@@ -154,6 +155,49 @@ Manifest format:
 - **`fps`** (default 30) and **`defaults`** (per-clip settings applied to every clip unless the clip overrides them) are optional. Per-clip keys mirror the CLI: `preset`, `log`, `crop_position`, `crop_position_end`, `easing`, `sharpen`, `denoise`, `saturation`, `vibrance`, `upscale`.
 - **Output** comes from the CLI positional or the manifest's `output`.
 - **Video only** — image inputs are rejected (use the still-image pipeline separately). Output is **silent** (add music in your editor / Instagram).
+
+### Grid tour — mosaic → zoom into each tile → out
+
+Arrange several photos/videos in a grid, open on the full mosaic, then "fly" into
+each chosen tile one at a time. The focused tile is **re-rendered from its full-res
+source** throughout the zoom (sharp the whole way, full quality at the end — not an
+upscaled thumbnail). Videos **play** while focused and their **audio is heard**
+during that hold; the grid and transitions are silent. Output is **IG Story
+(1080×1920)** or **IG Post (1080×1350, 4:5)**.
+
+```bash
+# Print a starter manifest, edit it, then render
+python media_processor.py --print-sample-grid > grid.json
+python media_processor.py --grid grid.json tour.mp4               # IG Story (default)
+python media_processor.py --grid grid.json tour.mp4 --format post # IG Post 4:5
+```
+
+Manifest format:
+
+```json
+{
+  "output": "grid_tour.mp4",
+  "format": "story",
+  "fps": 30,
+  "grid": { "rows": 2, "cols": 2, "gap": 8, "background": "#000000" },
+  "grid_hold": 1.5,
+  "zoom_duration": 0.6,
+  "grid_between": 0.4,
+  "default_hold": 3.0,
+  "assets": [
+    { "input": "photo1.jpg" },
+    { "input": "clip1.mp4", "poster": 1.0, "start": 2, "duration": 4 },
+    { "input": "photo2.jpg" },
+    { "input": "clip2.mov", "start": 0, "duration": 3 }
+  ],
+  "zoom": [0, 1, 2, 3]
+}
+```
+
+- **`grid`**: `rows`×`cols` (with optional `gap` px and hex `background`). You must supply **exactly `rows×cols` assets** (one per cell, row-major) — a mismatch is an error.
+- **assets**: images shown for `default_hold` (or the asset's `duration`); videos use `poster` (seconds) for the grid thumbnail and play `start`→`start+duration` (clamped 1–6 s) while focused.
+- **`zoom`**: tile indices (0-based, row-major) to tour, in order (default: all).
+- Timing: `grid_hold` (opening), `zoom_duration` (each zoom in/out), `grid_between` (pause between tiles), `default_hold` (image hold). `--format` overrides the manifest.
 
 ## Presets
 

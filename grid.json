@@ -1,0 +1,25 @@
+{
+  "output": "C:/Users/canbe/OneDrive/Documents/Claude/media_processor/outputs/vacation_tour.mp4",
+  "format": "story",
+  "fps": 30,
+  "grid": { "rows": 4, "gap": 10, "background": "#0a0a0a" },
+  "grid_hold": 1.5,
+  "zoom_duration": 0.7,
+  "grid_between": 0.6,
+  "default_hold": 0.75,
+  "assets": [
+    { "input": "H:/iPhone Media/IMG_8085.heic" },
+    { "input": "H:/iPhone Media/IMG_8109.heic" },
+    { "input": "H:/iPhone Media/IMG_8115.heic" },
+    { "input": "H:/iPhone Media/29064bcc-0fe4-434d-b191-77125dfd87a3.JPG" },
+    { "input": "H:/iPhone Media/495347FF-3333-46F4-BBD2-02A93405E235.MP4", "start": 0, "duration": 4 },
+    { "input": "H:/iPhone Media/f8989321-db79-4e1d-8b73-903067b369c9.MP4", "start": 0, "duration": 3 },
+    { "input": "H:/iPhone Media/IMG_8089.heic" },
+    { "input": "H:/iPhone Media/CB93AF3C-47B8-44F9-B504-0CE325E32856.JPG" },
+    { "input": "H:/iPhone Media/IMG_8103.heic" },
+    { "input": "H:/iPhone Media/0A607F57-B082-483C-8DCA-9A6EA8BC13C9.JPG" },
+    { "input": "C:/Users/canbe/Downloads/WhatsApp Video 2026-06-20 at 12.41.59 PM.mp4", "start": 0, "duration": 4 },
+    { "input": "C:/Users/canbe/Downloads/WhatsApp Video 2026-06-20 at 12.42.01 PM.mp4", "start": 0, "duration": 3 }
+  ],
+  "zoom": [8, 0, 6, 4, 5, 3, 7, 1, 2, 11]
+}
